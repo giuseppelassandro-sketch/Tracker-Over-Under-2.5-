@@ -5,6 +5,13 @@ on:
     # Ogni giovedì alle 06:00 UTC (08:00 in Italia d'estate, 07:00 d'inverno).
     # GitHub usa sempre UTC e può ritardare i job schedulati nei momenti di picco.
     - cron: "0 6 * * 4"
+  push:
+    branches: [main]
+    # Le modifiche puramente testuali non rigenerano la pagina: eviterebbero
+    # solo di consumare minuti senza cambiare nulla nell'output.
+    paths-ignore:
+      - "README.md"
+      - ".gitignore"
   workflow_dispatch: # permette l'avvio manuale dalla tab Actions
 
 permissions:
