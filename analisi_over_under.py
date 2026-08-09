@@ -26,15 +26,38 @@ import pandas as pd
 
 BASE = "https://www.football-data.co.uk"
 FIXTURES_URL = f"{BASE}/fixtures.csv"
+EXTRA_FIXTURES_URL = f"{BASE}/new_league_fixtures.csv"
 
-# Codici football-data.co.uk -> nome leggibile (stessi codici della colonna Div)
+# Campionati "principali": cartelle mmz4281 + fixtures.csv.
+# Le chiavi sono i codici usati nella colonna Div di football-data.co.uk.
 LEAGUES = {
     "I1": "Serie A",
     "E0": "Premier League",
     "SP1": "LaLiga",
     "D1": "Bundesliga",
     "F1": "Ligue 1",
+    "N1": "Eredivisie",
+    "P1": "Primeira Liga",
 }
+
+# Campionati "extra": stanno in /new/{CODICE}.csv e in new_league_fixtures.csv,
+# con uno schema diverso (Home/Away invece di HomeTeam/AwayTeam, HG/AG invece di
+# FTHG/FTAG, stagioni per anno solare) e SENZA quote Over/Under 2.5: per questi
+# la stima resta, mentre le colonne quota e scostamento restano vuote.
+# codice -> (nome paese in new_league_fixtures.csv, nome leggibile)
+EXTRA_LEAGUES = {
+    "SWE": ("Sweden", "Allsvenskan"),
+    "NOR": ("Norway", "Eliteserien"),
+}
+
+
+def league_name(code):
+    """Nome leggibile di un campionato, principale o extra."""
+    if code in LEAGUES:
+        return LEAGUES[code]
+    if code in EXTRA_LEAGUES:
+        return EXTRA_LEAGUES[code][1]
+    return code
 
 # Quante stagioni di storico includere (stagione corrente + N-1 precedenti)
 N_SEASONS = 3
@@ -73,8 +96,11 @@ SSL_CONTEXT = _ssl_context()
 # Download
 # --------------------------------------------------------------------------
 
-def fetch_csv(url):
+def fetch_csv(url, require_div=True):
     """Scarica un CSV. Ritorna un DataFrame, oppure None se manca (404) o e' illeggibile.
+
+    `require_div` distingue i file principali (che hanno la colonna Div) da quelli
+    dei campionati extra, che usano invece Country/League.
 
     football-data.co.uk risponde alle risorse mancanti con una pagina HTML e
     status 404: senza controllare lo status, pandas proverebbe a interpretare
@@ -104,7 +130,7 @@ def fetch_csv(url):
         print(f"  [skip] {url} -> CSV illeggibile: {e}", file=sys.stderr)
         return None
 
-    if df.empty or "Div" not in df.columns:
+    if df.empty or (require_div and "Div" not in df.columns):
         print(f"  [skip] {url} -> contenuto inatteso", file=sys.stderr)
         return None
     return df
@@ -124,6 +150,50 @@ def season_codes(today, n=N_SEASONS):
     return codes
 
 
+def load_extra_history(today, n=N_SEASONS):
+    """Storico dei campionati extra, normalizzato nello schema principale.
+
+    I file /new/{CODICE}.csv contengono tutte le stagioni dal 2012 in poi, con
+    stagioni per anno solare (2026) perche' questi campionati vanno da primavera
+    ad autunno. Si tengono solo le ultime `n`.
+    """
+    frames = []
+    for code in EXTRA_LEAGUES:
+        url = f"{BASE}/new/{code}.csv"
+        df = fetch_csv(url, require_div=False)
+        if df is None:
+            continue
+
+        needed = {"Season", "Home", "Away", "HG", "AG"}
+        if not needed.issubset(df.columns):
+            print(f"  [skip] {url} -> colonne mancanti", file=sys.stderr)
+            continue
+
+        df["Season"] = pd.to_numeric(df["Season"], errors="coerce")
+        df = df.dropna(subset=["Season"])
+        recent = sorted(df["Season"].unique())[-n:]
+        df = df[df["Season"].isin(recent)]
+
+        out = pd.DataFrame(
+            {
+                "Div": code,
+                "HomeTeam": df["Home"],
+                "AwayTeam": df["Away"],
+                "FTHG": pd.to_numeric(df["HG"], errors="coerce"),
+                "FTAG": pd.to_numeric(df["AG"], errors="coerce"),
+                "Season": df["Season"].astype(int).astype(str),
+            }
+        )
+        out["SeasonLabel"] = out["Season"]
+        frames.append(out)
+        print(
+            f"  [ok]   {code}: {len(out)} righe "
+            f"(stagioni {', '.join(str(int(s)) for s in recent)})",
+            file=sys.stderr,
+        )
+    return frames
+
+
 def load_history(today):
     """Scarica lo storico dei campionati configurati per le ultime N stagioni."""
     frames = []
@@ -139,8 +209,11 @@ def load_history(today):
                 continue
             df = df[list(needed)].copy()
             df["Season"] = season
+            df["SeasonLabel"] = f"{season[:2]}/{season[2:]}"
             frames.append(df)
             print(f"  [ok]   {season}/{code}: {len(df)} righe", file=sys.stderr)
+
+    frames.extend(load_extra_history(today))
 
     if not frames:
         # Stesse colonne del caso popolato, cosi' il resto della pipeline
@@ -153,6 +226,7 @@ def load_history(today):
                 "FTHG": pd.Series(dtype="float"),
                 "FTAG": pd.Series(dtype="float"),
                 "Season": pd.Series(dtype="object"),
+                "SeasonLabel": pd.Series(dtype="object"),
                 "TotGoals": pd.Series(dtype="float"),
                 "IsOver": pd.Series(dtype="int"),
             }
@@ -175,8 +249,16 @@ def build_team_rates(hist):
     """Tassi Over 2.5 per squadra, separati fra partite in casa e in trasferta.
 
     Ritorna (rates, league_avg):
-      rates[(div, team)] = {"home_rate", "home_n", "away_rate", "away_n"}
-      league_avg[div]    = tasso Over medio del campionato
+      rates[(div, team)] = {
+          "home_rate", "home_n", "away_rate", "away_n",   # su tutto lo storico
+          "seasons": {etichetta: {"home_raw", "home_n", "away_raw", "away_n"}},
+      }
+      league_avg[div] = tasso Over medio del campionato
+
+    I valori per stagione sono grezzi, non "smussati": servono a mostrare la
+    tendenza reale di una squadra stagione per stagione, e applicare lo shrinkage
+    la appiattirebbe proprio dove si vuole leggerla. Lo shrinkage resta invece sui
+    tassi complessivi, che alimentano la stima usata per la classifica.
     """
     league_avg = {}
     for div, grp in hist.groupby("Div"):
@@ -213,7 +295,31 @@ def build_team_rates(hist):
         rec.setdefault("away_rate", avg)
         rec.setdefault("away_n", 0)
 
+    # --- dettaglio per stagione (valori grezzi) ---
+    if len(hist):
+        hs = hist.groupby(["Div", "SeasonLabel", "HomeTeam"])["IsOver"].agg(["mean", "count"])
+        for (div, label, team), row in hs.iterrows():
+            s = rates.setdefault((div, team), {}).setdefault("seasons", {}).setdefault(label, {})
+            s["home_raw"] = float(row["mean"])
+            s["home_n"] = int(row["count"])
+
+        as_ = hist.groupby(["Div", "SeasonLabel", "AwayTeam"])["IsOver"].agg(["mean", "count"])
+        for (div, label, team), row in as_.iterrows():
+            s = rates.setdefault((div, team), {}).setdefault("seasons", {}).setdefault(label, {})
+            s["away_raw"] = float(row["mean"])
+            s["away_n"] = int(row["count"])
+
     return rates, league_avg
+
+
+def season_labels_by_div(hist):
+    """Etichette di stagione disponibili per ciascun campionato, in ordine."""
+    out = {}
+    if not len(hist):
+        return out
+    for div, grp in hist.groupby("Div"):
+        out[div] = sorted(grp["SeasonLabel"].dropna().unique())
+    return out
 
 
 # --------------------------------------------------------------------------
@@ -228,17 +334,50 @@ def to_float(value):
     return None if pd.isna(f) or f <= 1.0 else f
 
 
-def load_fixtures(today, leagues=None):
+def load_extra_fixtures(extra=None):
+    """Partite in arrivo dei campionati extra, normalizzate nello schema principale.
+
+    Questo file non contiene quote Over/Under 2.5 (solo 1X2): le colonne relative
+    restano assenti e a valle vengono trattate come mancanti.
+    """
+    extra = EXTRA_LEAGUES if extra is None else extra
+    if not extra:
+        return None
+
+    df = fetch_csv(EXTRA_FIXTURES_URL, require_div=False)
+    if df is None or df.empty or "Country" not in df.columns:
+        return None
+
+    paesi = {paese: code for code, (paese, _) in extra.items()}
+    df = df[df["Country"].isin(paesi)].copy()
+    if df.empty:
+        return None
+
+    df["Div"] = df["Country"].map(paesi)
+    df = df.rename(columns={"Home": "HomeTeam", "Away": "AwayTeam"})
+    keep = [c for c in ["Div", "Date", "Time", "HomeTeam", "AwayTeam"] if c in df.columns]
+    return df[keep]
+
+
+def load_fixtures(today, leagues=None, extra=None):
     """Partite in arrivo nei prossimi DAYS_AHEAD giorni per i campionati scelti."""
     leagues = leagues or LEAGUES
-    df = fetch_csv(FIXTURES_URL)
-    if df is None or df.empty:
+    parts = []
+
+    main = fetch_csv(FIXTURES_URL)
+    if main is not None and not main.empty:
+        sel = main[main["Div"].isin(leagues.keys())]
+        if not sel.empty:
+            parts.append(sel.copy())
+
+    ex = load_extra_fixtures(extra)
+    if ex is not None and not ex.empty:
+        parts.append(ex)
+
+    if not parts:
         return pd.DataFrame()
 
-    df = df[df["Div"].isin(leagues.keys())].copy()
-    if df.empty:
-        return df
-
+    df = pd.concat(parts, ignore_index=True)
     df["MatchDate"] = pd.to_datetime(
         df["Date"], format="%d/%m/%Y", errors="coerce"
     )
@@ -247,6 +386,8 @@ def load_fixtures(today, leagues=None):
     start = pd.Timestamp(today.date())
     end = start + pd.Timedelta(days=DAYS_AHEAD)
     df = df[(df["MatchDate"] >= start) & (df["MatchDate"] <= end)]
+    if df.empty:
+        return df
     return df.sort_values(["MatchDate", "Time"])
 
 
@@ -278,10 +419,26 @@ def analyse(fixtures, rates, league_avg, leagues=None):
 
         edge = (model_prob - fair) if fair is not None else None
 
+        # Dettaglio stagione per stagione: valore in casa della squadra di casa e
+        # valore in trasferta dell'ospite, tenuti distinti per leggere la tendenza.
+        per_season = {}
+        h_seasons = h.get("seasons", {})
+        a_seasons = a.get("seasons", {})
+        for label in set(h_seasons) | set(a_seasons):
+            hs = h_seasons.get(label, {})
+            as_ = a_seasons.get(label, {})
+            per_season[label] = {
+                "home": hs.get("home_raw"),
+                "home_n": hs.get("home_n", 0),
+                "away": as_.get("away_raw"),
+                "away_n": as_.get("away_n", 0),
+            }
+
         rows.append(
             {
                 "div": div,
-                "league": leagues.get(div, div),
+                "league": league_name(div),
+                "per_season": per_season,
                 "date": fx["MatchDate"],
                 "time": fx.get("Time", "") if pd.notna(fx.get("Time", "")) else "",
                 "home": home,
@@ -325,11 +482,6 @@ def data_it(ts):
     return f"{GIORNI[ts.weekday()]} {ts.day:02d}/{ts.month:02d}"
 
 
-def stagione_it(code):
-    """'2526' -> '25/26'."""
-    return f"{code[:2]}/{code[2:]}" if len(code) == 4 else code
-
-
 def esc(s):
     return (
         str(s)
@@ -371,11 +523,13 @@ text-transform:uppercase;color:var(--ink-soft)}
 margin-top:.15rem}
 .shell{background:var(--surface);border:1px solid var(--line);border-radius:10px;
 overflow-x:auto}
-table{width:100%;border-collapse:collapse;min-width:940px}
+table{width:100%;border-collapse:collapse;min-width:900px}
+td .match{overflow-wrap:normal}
+tbody td:nth-child(2){min-width:190px}
 thead th{background:var(--surface-2);text-align:left;font-size:.67rem;
 font-weight:700;letter-spacing:.07em;text-transform:uppercase;color:var(--ink-soft);
-padding:.7rem .8rem;border-bottom:1px solid var(--line);white-space:nowrap}
-tbody td{padding:.62rem .8rem;border-bottom:1px solid var(--line);font-size:.86rem}
+padding:.6rem .55rem;border-bottom:1px solid var(--line);white-space:nowrap}
+tbody td{padding:.55rem .55rem;border-bottom:1px solid var(--line);font-size:.84rem}
 tbody tr:last-child td{border-bottom:none}
 tbody tr:hover{background:var(--surface-2)}
 .num{font-variant-numeric:tabular-nums;text-align:right;white-space:nowrap}
@@ -400,6 +554,15 @@ line-height:1.6;display:grid;gap:.5rem}
 code{background:var(--surface-2);border:1px solid var(--line);border-radius:4px;
 padding:.05rem .3rem;font-size:.85em}
 .empty{padding:2.5rem 1rem;text-align:center;color:var(--ink-soft);font-size:.9rem}
+.league{display:flex;flex-direction:column;gap:.6rem}
+.league-head{display:flex;align-items:baseline;gap:.75rem;flex-wrap:wrap;
+border-left:3px solid var(--accent);padding-left:.7rem}
+.league-head h2{margin:0;font-size:1.25rem;letter-spacing:-.01em}
+.league-meta{color:var(--ink-soft);font-size:.78rem}
+th.season,td.season{background:color-mix(in srgb,var(--accent) 7%,transparent)}
+td.season .sv{font-weight:600}
+td.season .sep{color:var(--ink-soft);margin:0 .15rem;font-weight:400}
+td.season{white-space:nowrap}
 footer{color:var(--ink-soft);font-size:.78rem;text-align:center;line-height:1.6}
 @media(max-width:640px){.wrap{padding:1.5rem 1rem 3rem}}
 """
@@ -407,19 +570,39 @@ footer{color:var(--ink-soft);font-size:.78rem;text-align:center;line-height:1.6}
 
 def render_html(results, hist, league_avg, today, leagues=None):
     leagues = leagues or LEAGUES
+    n_leagues = len(leagues) + len(EXTRA_LEAGUES)
     generated = today.strftime("%d/%m/%Y %H:%M UTC")
     n_matches = len(results)
     n_hist = len(hist)
     hist_over = float(hist["IsOver"].mean()) if n_hist else None
     seasons = (
-        ", ".join(stagione_it(s) for s in sorted(hist["Season"].unique()))
+        ", ".join(sorted(hist["SeasonLabel"].dropna().unique()))
         if n_hist
         else "&mdash;"
     )
 
-    if n_matches:
+    season_cols = season_labels_by_div(hist)
+
+    def season_cell(info, label):
+        """Cella 'casa / trasferta' per una singola stagione."""
+        if not info:
+            return '<td class="num season">&mdash;</td>'
+        h, a = info.get("home"), info.get("away")
+        if h is None and a is None:
+            return '<td class="num season">&mdash;</td>'
+        hs = f"{h * 100:.0f}%" if h is not None else "&ndash;"
+        as_ = f"{a * 100:.0f}%" if a is not None else "&ndash;"
+        n = f"{info.get('home_n', 0)}/{info.get('away_n', 0)}"
+        return (
+            f'<td class="num season"><span class="sv">{hs}</span>'
+            f'<span class="sep">/</span><span class="sv">{as_}</span>'
+            f'<div class="when">{n} gare</div></td>'
+        )
+
+    def league_section(div, block):
+        labels = season_cols.get(div, [])
         rows_html = []
-        for i, r in results.iterrows():
+        for pos, (_, r) in enumerate(block.iterrows(), start=1):
             if r["edge"] is None or pd.isna(r["edge"]):
                 chip = '<span class="chip flat">no quota</span>'
             elif r["edge"] >= 0.05:
@@ -438,14 +621,18 @@ def render_html(results, hist, league_avg, today, leagues=None):
             home_note = f"{r['home_n']} gare" if r["home_n"] else "media lega"
             away_note = f"{r['away_n']} gare" if r["away_n"] else "media lega"
 
+            season_cells = "".join(
+                season_cell(r["per_season"].get(lb), lb) for lb in labels
+            )
+
             rows_html.append(
                 f"""<tr>
-<td class="rank">{i + 1}</td>
+<td class="rank">{pos}</td>
 <td><div class="match">{esc(r['home'])} &ndash; {esc(r['away'])}</div>
 <div class="when">{when}</div></td>
-<td><span class="badge">{esc(r['league'])}</span></td>
 <td class="num">{pct(r['home_rate'])}<div class="when">{home_note}</div></td>
 <td class="num">{pct(r['away_rate'])}<div class="when">{away_note}</div></td>
+{season_cells}
 <td><div class="bar-wrap"><span class="num">{pct(r['model_prob'])}</span>
 <div class="bar"><span style="width:{max(0, min(100, r['model_prob'] * 100)):.1f}%"></span></div>
 </div></td>
@@ -455,14 +642,37 @@ def render_html(results, hist, league_avg, today, leagues=None):
 </tr>"""
             )
 
-        table = f"""<div class="shell"><table>
+        season_heads = "".join(
+            f'<th class="num season">{esc(lb)}</th>' for lb in labels
+        )
+        avg_txt = pct(league_avg.get(div))
+        n_block = len(block)
+        return f"""<section class="league">
+<div class="league-head">
+  <h2>{esc(league_name(div))}</h2>
+  <span class="league-meta">{n_block} {'partita' if n_block == 1 else 'partite'}
+  &middot; media storica Over 2.5 {avg_txt}</span>
+</div>
+<div class="shell"><table>
 <thead><tr>
-<th>#</th><th>Partita</th><th>Camp.</th>
+<th>#</th><th>Partita</th>
 <th class="num">Over casa</th><th class="num">Over trasf.</th>
+{season_heads}
 <th class="num">Stima Over 2.5</th><th class="num">Quota Over</th>
 <th class="num">Prob. book</th><th class="num">Scostamento</th>
 </tr></thead>
-<tbody>{''.join(rows_html)}</tbody></table></div>"""
+<tbody>{''.join(rows_html)}</tbody></table></div>
+</section>"""
+
+    if n_matches:
+        # Ordine fisso: prima i campionati principali nell'ordine dichiarato,
+        # poi gli extra. Compaiono solo quelli con partite in programma.
+        ordine = list(LEAGUES.keys()) + list(EXTRA_LEAGUES.keys())
+        presenti = [d for d in ordine if d in set(results["div"])]
+        presenti += [d for d in results["div"].unique() if d not in ordine]
+        table = "".join(
+            league_section(d, results[results["div"] == d]) for d in presenti
+        )
     else:
         table = f"""<div class="shell"><div class="empty">
 Nessuna partita dei campionati monitorati nei prossimi {DAYS_AHEAD} giorni.<br>
@@ -472,9 +682,9 @@ resta vuota e si ripopola da sola alla prossima esecuzione.
 </div></div>"""
 
     league_rows = "".join(
-        f"<div><strong>{esc(leagues.get(d, d))}</strong>: media Over 2.5 storica "
+        f"<div><strong>{esc(league_name(d))}</strong>: media Over 2.5 storica "
         f"{pct(v)}</div>"
-        for d, v in sorted(league_avg.items())
+        for d, v in sorted(league_avg.items(), key=lambda kv: league_name(kv[0]))
     ) or "<div>Nessuno storico disponibile.</div>"
 
     return f"""<!doctype html>
@@ -491,7 +701,7 @@ resta vuota e si ripopola da sola alla prossima esecuzione.
 <div class="head">
   <div class="eyebrow">Aggiornamento automatico settimanale</div>
   <h1>Analisi Over/Under 2.5 gol</h1>
-  <p class="sub">Partite dei prossimi {DAYS_AHEAD} giorni nei 5 maggiori campionati europei,
+  <p class="sub">Partite dei prossimi {DAYS_AHEAD} giorni in {n_leagues} campionati europei,
   ordinate dalla piu' propensa all'Over 2.5 alla piu' propensa all'Under. La stima nasce
   dallo storico delle squadre; la quota affiancata mostra cosa ne pensa il mercato.</p>
   <div class="meta">Generato il {generated} &middot; dati:
@@ -515,12 +725,21 @@ resta vuota e si ripopola da sola alla prossima esecuzione.
   sullo storico caricato. Sotto, il numero di partite su cui e' calcolata: la dicitura
   <em>media lega</em> segnala una squadra assente dallo storico (neopromossa o appena salita
   di categoria), per la quale si usa la media del campionato al posto di un dato suo.</div>
+  <div><strong>Colonne per stagione</strong> (sfondo colorato) &mdash; lo stesso dato
+  stagione per stagione, per vedere se una squadra sta cambiando tendenza invece di
+  leggere un unico numero medio. Ogni cella riporta <em>squadra di casa / squadra
+  ospite</em>, e sotto il numero di partite di ciascuna in quella stagione. Sono valori
+  grezzi, non corretti verso la media di lega: a inizio stagione poggiano su pochissime
+  gare e vanno letti come indizio, non come misura.</div>
   <div><strong>Stima Over 2.5</strong> &mdash; media dei due tassi. Le squadre con poco
   storico (neopromosse) vengono avvicinate alla media del loro campionato con un peso
   pari a {PRIOR_MATCHES} partite, per non dare fiducia eccessiva a percentuali basate su
   pochissime gare.</div>
   <div><strong>Quota Over</strong> &mdash; <code>Avg&gt;2.5</code>, media dei bookmaker
-  (ripiego su <code>B365&gt;2.5</code> se assente).</div>
+  (ripiego su <code>B365&gt;2.5</code> se assente). Per Allsvenskan ed Eliteserien la fonte
+  pubblica solo le quote 1X2: per quelle partite quota, probabilita' del mercato e
+  scostamento restano vuoti e compare l'etichetta <em>no quota</em>, mentre la stima
+  statistica resta valida.</div>
   <div><strong>Prob. book</strong> &mdash; probabilita' implicita nella quota, ripulita dal
   margine del bookmaker normalizzando Over e Under (la somma grezza di
   <code>1/quota</code> supera sempre il 100%).</div>
