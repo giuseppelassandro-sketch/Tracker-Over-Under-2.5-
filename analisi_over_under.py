@@ -560,6 +560,17 @@ border-left:3px solid var(--accent);padding-left:.7rem}
 .league-head h2{margin:0;font-size:1.25rem;letter-spacing:-.01em}
 .league-meta{color:var(--ink-soft);font-size:.78rem}
 th.season,td.season{background:color-mix(in srgb,var(--accent) 7%,transparent)}
+/* Le stagioni passate restano nel documento ma nascoste finche' non si chiedono. */
+th.archive,td.archive{display:none}
+body.show-archive th.archive,body.show-archive td.archive{display:table-cell}
+th.archive,td.archive{background:color-mix(in srgb,var(--ink-soft) 8%,transparent)}
+.controls{display:flex;align-items:center;gap:.75rem;flex-wrap:wrap}
+.ctrl-btn{font:inherit;font-size:.82rem;font-weight:600;cursor:pointer;
+padding:.45rem .9rem;border-radius:999px;border:1px solid var(--line);
+background:var(--surface);color:var(--ink)}
+.ctrl-btn:hover{border-color:var(--accent);color:var(--accent)}
+.ctrl-btn:focus-visible{outline:2px solid var(--accent);outline-offset:2px}
+.ctrl-note{color:var(--ink-soft);font-size:.78rem}
 td.season .sv{font-weight:600}
 td.season .sep{color:var(--ink-soft);margin:0 .15rem;font-weight:400}
 td.season{white-space:nowrap}
@@ -583,24 +594,30 @@ def render_html(results, hist, league_avg, today, leagues=None):
 
     season_cols = season_labels_by_div(hist)
 
-    def season_cell(info, label):
+    def season_cell(info, cls):
         """Cella 'casa / trasferta' per una singola stagione."""
         if not info:
-            return '<td class="num season">&mdash;</td>'
+            return f'<td class="num {cls}">&mdash;</td>'
         h, a = info.get("home"), info.get("away")
         if h is None and a is None:
-            return '<td class="num season">&mdash;</td>'
+            return f'<td class="num {cls}">&mdash;</td>'
         hs = f"{h * 100:.0f}%" if h is not None else "&ndash;"
         as_ = f"{a * 100:.0f}%" if a is not None else "&ndash;"
         n = f"{info.get('home_n', 0)}/{info.get('away_n', 0)}"
         return (
-            f'<td class="num season"><span class="sv">{hs}</span>'
+            f'<td class="num {cls}"><span class="sv">{hs}</span>'
             f'<span class="sep">/</span><span class="sv">{as_}</span>'
             f'<div class="when">{n} gare</div></td>'
         )
 
     def league_section(div, block):
         labels = season_cols.get(div, [])
+        # L'ultima etichetta in ordine e' la stagione piu' recente disponibile:
+        # resta sempre visibile, le precedenti finiscono in archivio.
+        corrente = labels[-1] if labels else None
+
+        def cls_for(lb):
+            return "season" if lb == corrente else "season archive"
         rows_html = []
         for pos, (_, r) in enumerate(block.iterrows(), start=1):
             if r["edge"] is None or pd.isna(r["edge"]):
@@ -622,7 +639,7 @@ def render_html(results, hist, league_avg, today, leagues=None):
             away_note = f"{r['away_n']} gare" if r["away_n"] else "media lega"
 
             season_cells = "".join(
-                season_cell(r["per_season"].get(lb), lb) for lb in labels
+                season_cell(r["per_season"].get(lb), cls_for(lb)) for lb in labels
             )
 
             rows_html.append(
@@ -643,7 +660,7 @@ def render_html(results, hist, league_avg, today, leagues=None):
             )
 
         season_heads = "".join(
-            f'<th class="num season">{esc(lb)}</th>' for lb in labels
+            f'<th class="num {cls_for(lb)}">{esc(lb)}</th>' for lb in labels
         )
         avg_txt = pct(league_avg.get(div))
         n_block = len(block)
@@ -673,6 +690,19 @@ def render_html(results, hist, league_avg, today, leagues=None):
         table = "".join(
             league_section(d, results[results["div"] == d]) for d in presenti
         )
+        # L'interruttore serve solo se esiste davvero uno storico da mostrare.
+        n_archivio = sum(
+            max(0, len(season_cols.get(d, [])) - 1) for d in presenti
+        )
+        if n_archivio:
+            table = (
+                '<div class="controls">'
+                '<button type="button" id="toggleArchive" class="ctrl-btn" '
+                'aria-expanded="false">Mostra stagioni precedenti</button>'
+                '<span class="ctrl-note">Di base ogni campionato mostra solo '
+                "la stagione piu' recente.</span>"
+                "</div>" + table
+            )
     else:
         table = f"""<div class="shell"><div class="empty">
 Nessuna partita dei campionati monitorati nei prossimi {DAYS_AHEAD} giorni.<br>
@@ -730,7 +760,10 @@ resta vuota e si ripopola da sola alla prossima esecuzione.
   leggere un unico numero medio. Ogni cella riporta <em>squadra di casa / squadra
   ospite</em>, e sotto il numero di partite di ciascuna in quella stagione. Sono valori
   grezzi, non corretti verso la media di lega: a inizio stagione poggiano su pochissime
-  gare e vanno letti come indizio, non come misura.</div>
+  gare e vanno letti come indizio, non come misura. In vista resta solo la stagione piu'
+  recente di ogni campionato; le precedenti si aprono col pulsante
+  <em>Mostra stagioni precedenti</em>. La stima e la classifica usano comunque tutte le
+  stagioni caricate, archiviate comprese: il pulsante cambia solo cosa si vede.</div>
   <div><strong>Stima Over 2.5</strong> &mdash; media dei due tassi. Le squadre con poco
   storico (neopromosse) vengono avvicinate alla media del loro campionato con un peso
   pari a {PRIOR_MATCHES} partite, per non dare fiducia eccessiva a percentuali basate su
@@ -758,6 +791,20 @@ scommessa ne' garanzia di risultato. Il gioco puo' causare dipendenza.
 </footer>
 
 </div>
+
+<script>
+(function () {{
+  var btn = document.getElementById("toggleArchive");
+  if (!btn) return;
+  btn.addEventListener("click", function () {{
+    var aperto = document.body.classList.toggle("show-archive");
+    btn.textContent = aperto
+      ? "Nascondi stagioni precedenti"
+      : "Mostra stagioni precedenti";
+    btn.setAttribute("aria-expanded", aperto ? "true" : "false");
+  }});
+}})();
+</script>
 </body>
 </html>"""
 
