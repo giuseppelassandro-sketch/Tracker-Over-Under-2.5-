@@ -65,6 +65,13 @@ N_SEASONS = 3
 # Finestra delle partite da mostrare (giorni da oggi)
 DAYS_AHEAD = 8
 
+# Soglie di evidenziazione. Valgono in modo simmetrico per Over e Under, dato che
+# le due probabilita' sono complementari: Under 60% equivale a Over 40%. La soglia
+# di pareggio a quota 1.90 e' 52.6%, quindi sotto il 55% non c'e' propensione da
+# segnalare in nessuna delle due direzioni.
+SOGLIA_OVER_FORTE = 0.60
+SOGLIA_OVER_MEDIA = 0.55
+
 # Forza dello "shrinkage" bayesiano verso la media del campionato, espressa in
 # numero di partite equivalenti. Serve per le squadre con poco storico
 # (neopromosse): con 4 partite giocate il loro tasso grezzo e' inaffidabile,
@@ -310,6 +317,18 @@ def build_team_rates(hist):
             s["away_n"] = int(row["count"])
 
     return rates, league_avg
+
+
+def current_season_label(div, today):
+    """Etichetta della stagione in corso secondo il calendario, non secondo i dati.
+
+    I campionati extra (Svezia, Norvegia) vanno da primavera ad autunno e usano
+    l'anno solare; gli altri usano la stagione a cavallo di due anni.
+    """
+    if div in EXTRA_LEAGUES:
+        return str(today.year)
+    code = season_codes(today, 1)[0]
+    return f"{code[:2]}/{code[2:]}"
 
 
 def season_labels_by_div(hist):
@@ -564,6 +583,35 @@ th.season,td.season{background:color-mix(in srgb,var(--accent) 7%,transparent)}
 th.archive,td.archive{display:none}
 body.show-archive th.archive,body.show-archive td.archive{display:table-cell}
 th.archive,td.archive{background:color-mix(in srgb,var(--ink-soft) 8%,transparent)}
+/* Evidenziazione delle partite piu' propense all'Over. Il tono e' piu' marcato
+   sulle colonne stagione, che hanno gia' un fondo loro. */
+tbody tr.hot td{background:color-mix(in srgb,var(--good) 9%,transparent)}
+tbody tr.warm td{background:color-mix(in srgb,var(--good) 4%,transparent)}
+tbody tr.hot td.season{background:color-mix(in srgb,var(--good) 16%,transparent)}
+tbody tr.warm td.season{background:color-mix(in srgb,var(--good) 9%,transparent)}
+tbody tr.hot td:first-child{box-shadow:inset 3px 0 0 var(--good)}
+tbody tr.warm td:first-child{box-shadow:inset 3px 0 0
+color-mix(in srgb,var(--good) 45%,transparent)}
+tbody tr.hot .bar>span,tbody tr.warm .bar>span{background:var(--good)}
+/* Stesso schema, colore opposto, per le partite che pendono verso l'Under. */
+tbody tr.hot-under td{background:color-mix(in srgb,var(--risk) 9%,transparent)}
+tbody tr.warm-under td{background:color-mix(in srgb,var(--risk) 4%,transparent)}
+tbody tr.hot-under td.season{background:color-mix(in srgb,var(--risk) 16%,transparent)}
+tbody tr.warm-under td.season{background:color-mix(in srgb,var(--risk) 9%,transparent)}
+tbody tr.hot-under td:first-child{box-shadow:inset 3px 0 0 var(--risk)}
+tbody tr.warm-under td:first-child{box-shadow:inset 3px 0 0
+color-mix(in srgb,var(--risk) 45%,transparent)}
+tbody tr.hot-under .bar>span,tbody tr.warm-under .bar>span{background:var(--risk)}
+/* Coppie Over/Under: il primo valore verde, il secondo rosso. */
+.duo .ov{color:var(--good);font-weight:700}
+.duo .un{color:var(--risk);font-weight:700}
+.duo .sep{color:var(--ink-soft);margin:0 .12rem;font-weight:400}
+thead th .ov{color:var(--good)}
+thead th .un{color:var(--risk)}
+.top-badge{display:inline-block;margin-left:.45rem;font-size:.63rem;font-weight:700;
+letter-spacing:.04em;text-transform:uppercase;padding:.1rem .4rem;border-radius:999px;
+background:var(--good);color:var(--surface);vertical-align:.08em}
+.top-badge.under{background:var(--risk)}
 .controls{display:flex;align-items:center;gap:.75rem;flex-wrap:wrap}
 .ctrl-btn{font:inherit;font-size:.82rem;font-weight:600;cursor:pointer;
 padding:.45rem .9rem;border-radius:999px;border:1px solid var(--line);
@@ -611,10 +659,39 @@ def render_html(results, hist, league_avg, today, leagues=None):
         )
 
     def league_section(div, block):
+        n_blocco = len(block)
+        # Le partite sono ordinate per stima Over decrescente: la prima e' la piu'
+        # Over, l'ultima la piu' Under. Con una sola partita in programma non ha
+        # senso etichettarla come entrambe: vince la direzione verso cui pende.
+        probs = [round(p * 100, 1) / 100 for p in block["model_prob"]]
+        idx_over = 0 if probs and probs[0] >= SOGLIA_OVER_MEDIA else None
+        idx_under = (
+            n_blocco - 1
+            if probs and (1 - probs[-1]) >= SOGLIA_OVER_MEDIA
+            else None
+        )
+        if idx_over is not None and idx_over == idx_under:
+            if probs[0] >= 0.5:
+                idx_under = None
+            else:
+                idx_over = None
+
         labels = season_cols.get(div, [])
-        # L'ultima etichetta in ordine e' la stagione piu' recente disponibile:
-        # resta sempre visibile, le precedenti finiscono in archivio.
-        corrente = labels[-1] if labels else None
+        # Resta in vista la stagione in corso secondo il calendario. Se la fonte
+        # non l'ha ancora pubblicata (capita nelle prime giornate) si mostra la
+        # piu' recente disponibile, dicendo esplicitamente perche'.
+        attesa = current_season_label(div, today)
+        if attesa in labels:
+            corrente = attesa
+            nota_stagione = ""
+        else:
+            corrente = labels[-1] if labels else None
+            nota_stagione = (
+                f" &middot; stagione {esc(attesa)} non ancora pubblicata dalla fonte:"
+                f" in vista {esc(corrente)}"
+                if corrente
+                else ""
+            )
 
         def cls_for(lb):
             return "season" if lb == corrente else "season archive"
@@ -642,19 +719,51 @@ def render_html(results, hist, league_avg, today, leagues=None):
                 season_cell(r["per_season"].get(lb), cls_for(lb)) for lb in labels
             )
 
+            # Evidenziazione: due livelli in base alla stima, piu' un contrassegno
+            # sulla partita piu' Over del campionato (solo se propende davvero
+            # all'Over: in una giornata tutta da Under non si segnala nulla).
+            # Il confronto usa il valore ARROTONDATO come in tabella: una stima di
+            # 0.54954 si legge "55.0%", e lasciarla non evidenziata con la soglia
+            # al 55% apparirebbe come un errore.
+            prob = r["model_prob"]
+            prob_vista = round(prob * 100, 1) / 100
+            prob_under = 1 - prob_vista
+
+            if prob_vista >= SOGLIA_OVER_FORTE:
+                tr_cls = ' class="hot"'
+            elif prob_vista >= SOGLIA_OVER_MEDIA:
+                tr_cls = ' class="warm"'
+            elif prob_under >= SOGLIA_OVER_FORTE:
+                tr_cls = ' class="hot-under"'
+            elif prob_under >= SOGLIA_OVER_MEDIA:
+                tr_cls = ' class="warm-under"'
+            else:
+                tr_cls = ""
+
+            i0 = pos - 1
+            if i0 == idx_over:
+                top_badge = '<span class="top-badge">piu\' Over</span>'
+            elif i0 == idx_under:
+                top_badge = '<span class="top-badge under">piu\' Under</span>'
+            else:
+                top_badge = ""
+
             rows_html.append(
-                f"""<tr>
+                f"""<tr{tr_cls}>
 <td class="rank">{pos}</td>
-<td><div class="match">{esc(r['home'])} &ndash; {esc(r['away'])}</div>
+<td><div class="match">{esc(r['home'])} &ndash; {esc(r['away'])}{top_badge}</div>
 <div class="when">{when}</div></td>
 <td class="num">{pct(r['home_rate'])}<div class="when">{home_note}</div></td>
 <td class="num">{pct(r['away_rate'])}<div class="when">{away_note}</div></td>
 {season_cells}
-<td><div class="bar-wrap"><span class="num">{pct(r['model_prob'])}</span>
+<td><div class="bar-wrap"><span class="num duo"><span class="ov">{pct(r['model_prob'])}</span>
+<span class="sep">/</span><span class="un">{pct(1 - r['model_prob'])}</span></span>
 <div class="bar"><span style="width:{max(0, min(100, r['model_prob'] * 100)):.1f}%"></span></div>
 </div></td>
-<td class="num">{num(r['odds_over'])}</td>
-<td class="num">{pct(r['fair'])}</td>
+<td class="num duo"><span class="ov">{num(r['odds_over'])}</span>
+<span class="sep">/</span><span class="un">{num(r['odds_under'])}</span></td>
+<td class="num duo"><span class="ov">{pct(r['fair'])}</span>
+<span class="sep">/</span><span class="un">{pct(None if r['fair'] is None or pd.isna(r['fair']) else 1 - r['fair'])}</span></td>
 <td class="num">{chip}</td>
 </tr>"""
             )
@@ -668,15 +777,17 @@ def render_html(results, hist, league_avg, today, leagues=None):
 <div class="league-head">
   <h2>{esc(league_name(div))}</h2>
   <span class="league-meta">{n_block} {'partita' if n_block == 1 else 'partite'}
-  &middot; media storica Over 2.5 {avg_txt}</span>
+  &middot; media storica Over 2.5 {avg_txt}{nota_stagione}</span>
 </div>
 <div class="shell"><table>
 <thead><tr>
 <th>#</th><th>Partita</th>
 <th class="num">Over casa</th><th class="num">Over trasf.</th>
 {season_heads}
-<th class="num">Stima Over 2.5</th><th class="num">Quota Over</th>
-<th class="num">Prob. book</th><th class="num">Scostamento</th>
+<th class="num">Stima <span class="ov">Over</span> / <span class="un">Under</span></th>
+<th class="num">Quota <span class="ov">O</span> / <span class="un">U</span></th>
+<th class="num">Prob. book <span class="ov">O</span> / <span class="un">U</span></th>
+<th class="num">Scostamento</th>
 </tr></thead>
 <tbody>{''.join(rows_html)}</tbody></table></div>
 </section>"""
@@ -776,6 +887,17 @@ resta vuota e si ripopola da sola alla prossima esecuzione.
   <div><strong>Prob. book</strong> &mdash; probabilita' implicita nella quota, ripulita dal
   margine del bookmaker normalizzando Over e Under (la somma grezza di
   <code>1/quota</code> supera sempre il 100%).</div>
+  <div><strong>Stima Over / Under</strong> &mdash; i due valori sono complementari
+  (sommano al 100%): sono lo stesso pronostico letto dai due lati, non due calcoli
+  diversi. Vale anche per la probabilita' del mercato. La <strong>quota</strong>,
+  invece, e' un prezzo a se' per ciascuno dei due esiti.</div>
+  <div><strong>Righe evidenziate</strong> &mdash; in <span class="ov">verde</span> le
+  partite che pendono verso l'Over, in <span class="un">rosso</span> quelle che pendono
+  verso l'Under: tinta piena da {SOGLIA_OVER_FORTE:.0%} in su, piu' tenue da
+  {SOGLIA_OVER_MEDIA:.0%}. Le etichette <em>piu' Over</em> e <em>piu' Under</em> segnalano
+  gli estremi di ogni campionato e compaiono solo se superano il
+  {SOGLIA_OVER_MEDIA:.0%}: in una giornata equilibrata non viene segnalato nulla. Le
+  soglie sono assolute, non relative al singolo campionato.</div>
   <div><strong>Scostamento</strong> &mdash; differenza fra la stima e la probabilita' del
   mercato, in punti percentuali. Oltre &plusmn;5pt viene evidenziato. Uno scostamento ampio
   segnala che il modello e il mercato la vedono diversamente, non che il modello abbia
