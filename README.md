@@ -10,7 +10,7 @@ la confronta con la quota dei bookmaker e rigenera la pagina.
 
 ## Come funziona
 
-1. **Storico** — scarica le ultime 3 stagioni di ogni campionato
+1. **Storico** — scarica la stagione in cors di ogni campionato
    (`mmz4281/{stagione}/{codice}.csv`) e calcola per ogni squadra la quota parte
    di partite chiuse con 3+ gol, separando gare in casa e in trasferta.
 2. **Partite in arrivo** — legge `fixtures.csv`, che contiene le gare imminenti
